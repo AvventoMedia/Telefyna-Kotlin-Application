@@ -1,0 +1,138 @@
+name: Build & Release Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        type: choice
+        description: 'Version Bump Type'
+        required: true
+        default: 'current'
+        options:
+          - current
+          - minor
+          - patch
+          - major
+          - manual
+      custom_version:
+        description: 'Custom Version Name (only if bump_type is manual, e.g. 2.0.0)'
+        required: false
+        default: ''
+      release_notes:
+        description: 'Release Notes / Description'
+        required: false
+        default: 'Telefyna 2.0.0 — Persistent gapless streaming, broadcast graphic overlay persistence, and Android TV storage permission architecture.'
+
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    name: Build & Create Release
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Grant Execute Permission for Gradle Wrapper
+        run: chmod +x gradlew
+
+      - name: Calculate & Apply Version Bump
+        id: version_bump
+        run: |
+          # Extract current version from app/build.gradle.kts
+          CURRENT_VERSION=$(grep 'versionName =' app/build.gradle.kts | sed -E 's/.*"([^"]+)".*/\1/')
+          CURRENT_CODE=$(grep 'versionCode =' app/build.gradle.kts | sed -E 's/.*= ([0-9]+).*/\1/')
+
+          echo "Current Version Name: $CURRENT_VERSION"
+          echo "Current Version Code: $CURRENT_CODE"
+
+          # Parse MAJOR.MINOR.PATCH
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+          MAJOR=${MAJOR:-2}
+          MINOR=${MINOR:-0}
+          PATCH=${PATCH:-0}
+
+          BUMP_TYPE="${{ github.event.inputs.bump_type }}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "$BUMP_TYPE" = "major" ]; then
+              NEW_MAJOR=$((MAJOR + 1))
+              NEW_VERSION="${NEW_MAJOR}.0.0"
+              NEW_CODE=$((CURRENT_CODE + 1))
+            elif [ "$BUMP_TYPE" = "minor" ]; then
+              NEW_MINOR=$((MINOR + 1))
+              NEW_VERSION="${MAJOR}.${NEW_MINOR}.0"
+              NEW_CODE=$((CURRENT_CODE + 1))
+            elif [ "$BUMP_TYPE" = "patch" ]; then
+              NEW_PATCH=$((PATCH + 1))
+              NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+              NEW_CODE=$((CURRENT_CODE + 1))
+            elif [ "$BUMP_TYPE" = "manual" ] && [ -n "${{ github.event.inputs.custom_version }}" ]; then
+              NEW_VERSION="${{ github.event.inputs.custom_version }}"
+              NEW_CODE=$((CURRENT_CODE + 1))
+            else
+              # 'current' / default: Release current version (2.0.0) as-is
+              NEW_VERSION="$CURRENT_VERSION"
+              NEW_CODE="$CURRENT_CODE"
+            fi
+
+            # Update app/build.gradle.kts
+            sed -i "s/versionCode = .*/versionCode = $NEW_CODE/" app/build.gradle.kts
+            sed -i "s/versionName = .*/versionName = \"$NEW_VERSION\"/" app/build.gradle.kts
+
+            TAG="v${NEW_VERSION}"
+            NOTES="${{ github.event.inputs.release_notes }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+            NEW_VERSION="${TAG#v}"
+            NOTES="Automated release for tag ${TAG}"
+          fi
+
+          echo "New Version Name: $NEW_VERSION"
+          echo "New Tag: $TAG"
+
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
+          echo "NOTES=$NOTES" >> $GITHUB_ENV
+
+      - name: Commit & Push Version Bump (Manual Dispatch Only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add app/build.gradle.kts
+          git commit -m "chore(release): release version ${{ env.NEW_VERSION }}" || true
+          git tag -a "${{ env.TAG }}" -m "${{ env.NOTES }}" || true
+          git push origin HEAD:${{ github.ref_name }} --follow-tags
+
+      - name: Build Debug & Release APKs
+        run: ./gradlew assembleDebug assembleRelease
+
+      - name: Create GitHub Release & Upload APKs
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Telefyna ${{ env.TAG }}
+          body: ${{ env.NOTES }}
+          draft: false
+          prerelease: false
+          files: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/release/app-release-unsigned.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

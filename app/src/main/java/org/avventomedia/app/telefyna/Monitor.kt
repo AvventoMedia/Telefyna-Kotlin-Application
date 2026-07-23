@@ -103,8 +103,12 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
         // Define a reusable Gson instance outside the function to avoid repeated creation
         private val gson = GsonBuilder().setPrettyPrinting().create()
         private val possibleExtensions = listOf("webp", "png", "jpg", "gif")
+        private val durationCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Long>>()
     }
 
+    private var isMaintenanceStarted = false
+    private var activeLogoState: String? = null
+    private var activeTickerState: String? = null
     private lateinit var sharedPreferences: SharedPreferences
 
     var configuration: Config? = null
@@ -315,9 +319,8 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
             registerReceiver(keepOnAirReceiver, filter)
         }
 
-        // Initialize permissions
-        initialiseWithPermissions()
-        maintenance!!.run()
+        // Initialize permissions and start maintenance only when permitted
+        startMaintenanceIfPermitted()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -446,20 +449,23 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
 
     @OptIn(UnstableApi::class)
     private fun buildPlayer(context: Context): ExoPlayer {
-        /*
-        val delay = getConfiguration().wait * 1000
-        val builder = DefaultLoadControl.Builder()
-        builder.setBufferDurationsMs(
-            DefaultLoadControl.DEFAULT_MIN_BUFFER_MS + delay,
-            (DefaultLoadControl.DEFAULT_MAX_BUFFER_MS + (delay * 2)) * 2,
-            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS + delay,
-            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS + delay
-        )
-        val player = SimpleExoPlayer.Builder(instance).setLoadControl(builder.build()).build()
-        */
-        // Create a custom RenderersFactory if needed
         val renderersFactory = instance?.let { TelefynaRenderersFactory(it) }
-        player = renderersFactory?.let { ExoPlayer.Builder(context, it).build() }
+        val audioAttributes = androidx.media3.common.AudioAttributes.Builder()
+            .setUsage(androidx.media3.common.C.USAGE_MEDIA)
+            .setContentType(androidx.media3.common.C.AUDIO_CONTENT_TYPE_MOVIE)
+            .build()
+
+        player = if (renderersFactory != null) {
+            ExoPlayer.Builder(context, renderersFactory)
+                .setAudioAttributes(audioAttributes, true)
+                .setHandleAudioBecomingNoisy(true)
+                .build()
+        } else {
+            ExoPlayer.Builder(context)
+                .setAudioAttributes(audioAttributes, true)
+                .setHandleAudioBecomingNoisy(true)
+                .build()
+        }
 
         return player as ExoPlayer
     }
@@ -542,21 +548,19 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
                     Logger.log(AuditLog.Event.EMPTY_FILLERS)
                     switchNow(firstDefaultIndex, isCurrentSlot, context)
                     return
-                } else {
-                    if (programItems.isEmpty()) {
-                        Logger.log(AuditLog.Event.PLAYLIST_EMPTY_PLAY, getPlayingAtIndexLabel(nowPlayingIndex))
-                        switchNow(currentPlaylist!!.emptyReplacer ?: firstDefaultIndex, isCurrentSlot, context)
-                        return
-                    } else {
-                        // Assign current player to previousPlayer before creating a new one
-                        previousPlayer = player
+                }
+                if (programItems.isEmpty()) {
+                    Logger.log(AuditLog.Event.PLAYLIST_EMPTY_PLAY, getPlayingAtIndexLabel(nowPlayingIndex))
+                    switchNow(currentPlaylist!!.emptyReplacer ?: firstDefaultIndex, isCurrentSlot, context)
+                    return
+                }
 
-                        // Immediately release previous player
-                        if (previousPlayer != null) {
-                            endPlayerSafely(previousPlayer)
-                            previousPlayer = null
-                        }
-                        player = buildPlayer(context) // Create a new player
+                if (player == null) {
+                    player = buildPlayer(context)
+                } else {
+                    player!!.stop()
+                    player!!.clearMediaItems()
+                }
 
                         // Reset tracking now playing if the playlist programs were modified
                         val modifiedOffset = playlistModified(nowPlayingIndex!!)
@@ -668,10 +672,12 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
                             player!!.volume = 0f
                             val fadeInAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
                                 duration = CROSS_FADE_DURATION
-                                addUpdateListener { player!!.volume = it.animatedValue as Float }
+                                addUpdateListener { player?.volume = it.animatedValue as Float }
                             }
                             fadeInAnimator.start()
                             Logger.log(AuditLog.Event.FADE_PLAYED, "fade in transition played")
+                        } else {
+                            player!!.volume = 1f
                         }
                         instance?.let { player!!.addListener(it) }
                         player!!.playWhenReady = true
@@ -688,8 +694,6 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
                         // Log now playing
                         cacheNowPlaying(false)
                         triggerGraphics(nowPosition)
-                    }
-                }
             }
         }
     }
@@ -710,20 +714,34 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
         }
     }
 
-    // Retrieve video duration in milliseconds
+    // Retrieve video duration in milliseconds safely without creating MediaPlayer decoder instances
     private fun getDuration(path: String): Long {
-        var mediaPlayer: MediaPlayer? = null
-        var duration: Long = 0
-        try {
-            mediaPlayer = MediaPlayer().apply {
-                instance?.let { setDataSource(it, Uri.parse(path)) }
-                prepare()
+        val cleanPath = path.replace("file://", "")
+        val file = File(cleanPath)
+        if (!file.exists()) return 0L
+        val lastModified = file.lastModified()
+
+        durationCache[cleanPath]?.let { (cachedTime, cachedDuration) ->
+            if (cachedTime == lastModified) {
+                return cachedDuration
             }
-            duration = mediaPlayer.duration.toLong()
+        }
+
+        var duration = 0L
+        try {
+            android.media.MediaMetadataRetriever().use { retriever ->
+                retriever.setDataSource(cleanPath)
+                val timeStr = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+                if (timeStr != null) {
+                    duration = timeStr.toLong()
+                }
+            }
         } catch (e: Exception) {
-            Logger.log(AuditLog.Event.ERROR, e.message ?: "Unknown error")
-        } finally {
-            mediaPlayer?.release()
+            Logger.log(AuditLog.Event.ERROR, "Error reading duration for $cleanPath: ${e.message}")
+        }
+
+        if (duration > 0) {
+            durationCache[cleanPath] = Pair(lastModified, duration)
         }
         return duration
     }
@@ -890,19 +908,15 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
         }
     }
 
-    fun endPlayerSafely(player: Player?) {
-        if (player == null) return  // Avoid unnecessary execution
+    fun endPlayerSafely(targetPlayer: Player?) {
+        if (targetPlayer == null) return  // Avoid unnecessary execution
         try {
-            player.stop()  // Stop playback
-            player.clearMediaItems()  // Remove media items
-            GlobalScope.launch(Dispatchers.Main) {
-                delay(300)
-                player.release()  // Fully release ExoPlayer
-            }
+            targetPlayer.stop()  // Stop playback
+            targetPlayer.clearMediaItems()  // Remove media items
+            targetPlayer.release()  // Synchronously release ExoPlayer
         } catch (e: Exception) {
             Logger.log(AuditLog.Event.PLAYLIST_ERROR, "${e.localizedMessage}")
         }
-
     }
 
 
@@ -919,7 +933,11 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
         maintenanceHandler?.removeCallbacksAndMessages(null)
         handler?.removeCallbacksAndMessages(null)
         // Unregister receiver and cancel alarm
-        unregisterReceiver(keepOnAirReceiver)
+        try {
+            unregisterReceiver(keepOnAirReceiver)
+        } catch (e: Exception) {
+            // ignore if not registered
+        }
         val intent = Intent(KEEP_ON_AIR_ACTION)
         val pendingIntent = PendingIntent.getBroadcast(
             this, 0, intent,
@@ -930,6 +948,19 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
         Glide.get(this).clearMemory()
         Glide.get(this).trimMemory(TRIM_MEMORY_COMPLETE)
 
+        if (instance == this) {
+            instance = null
+        }
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        try {
+            Glide.get(this).clearMemory()
+            Glide.get(this).trimMemory(level)
+        } catch (e: Exception) {
+            // Ignore glide trim exceptions
+        }
     }
 
     override fun onStop() {
@@ -952,11 +983,41 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
     }
 
     @RequiresApi(Build.VERSION_CODES.N)
-    private fun initialiseWithPermissions() {
-        val permissionsToRequest = missingPermissions()
-        if (permissionsToRequest.isNotEmpty()) {
-            askForPermissions(permissionsToRequest)
+    private fun startMaintenanceIfPermitted() {
+        val missing = missingPermissions()
+        if (missing.isEmpty()) {
+            if (!isMaintenanceStarted) {
+                isMaintenanceStarted = true
+                maintenance?.run()
+            }
+        } else if (isAndroidTV()) {
+            // Android TV / Google TV has no Settings UI for MANAGE_EXTERNAL_STORAGE.
+            // The permission must be granted via ADB: adb shell appops set <package> MANAGE_EXTERNAL_STORAGE allow
+            // Proceed with maintenance anyway — the app will handle missing files gracefully.
+            Logger.log(AuditLog.Event.ERROR, "MANAGE_EXTERNAL_STORAGE not granted on TV. Grant via ADB: adb shell appops set ${packageName} MANAGE_EXTERNAL_STORAGE allow")
+            if (!isMaintenanceStarted) {
+                isMaintenanceStarted = true
+                maintenance?.run()
+            }
+        } else {
+            askForPermissions(missing)
         }
+    }
+
+    private fun isAndroidTV(): Boolean {
+        return packageManager.hasSystemFeature("android.software.leanback")
+    }
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    override fun onResume() {
+        super.onResume()
+        startMaintenanceIfPermitted()
+    }
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        startMaintenanceIfPermitted()
     }
 
     @SuppressLint("QueryPermissionsNeeded")
@@ -965,13 +1026,23 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
             if (permissions.isNotEmpty()) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && permissions.contains(Manifest.permission.MANAGE_EXTERNAL_STORAGE)) {
                     // Redirect to system settings for `MANAGE_EXTERNAL_STORAGE`
-                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                    intent.data = Uri.fromParts("package", it.packageName, null)
-                    if (intent.resolveActivity(it.packageManager) != null) {
+                    try {
+                        val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                            data = Uri.fromParts("package", it.packageName, null)
+                        }
                         it.startActivityForResult(intent, MANAGE_STORAGE_REQUEST_CODE)
-                    } else {
-                        //TODO: Incase no permissions show a screen like no permission (this prevents the restart due to permission failing)
-                        Toast.makeText(it, "Unable to open settings for file access permission", Toast.LENGTH_LONG).show()
+                    } catch (e: Exception) {
+                        try {
+                            val fallbackIntent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                            it.startActivityForResult(fallbackIntent, MANAGE_STORAGE_REQUEST_CODE)
+                        } catch (e2: Exception) {
+                            // No Settings UI available (common on TV devices) — log and proceed
+                            Logger.log(AuditLog.Event.ERROR, "No file access settings UI available. Grant via ADB: adb shell appops set ${it.packageName} MANAGE_EXTERNAL_STORAGE allow")
+                            if (!isMaintenanceStarted) {
+                                isMaintenanceStarted = true
+                                maintenance?.run()
+                            }
+                        }
                     }
                 } else {
                     // Request permissions normally
@@ -982,32 +1053,26 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
     }
 
     private fun missingPermissions(): List<String> {
-        val requiredPermissions = mutableListOf<String>()
+        val missing = mutableListOf<String>()
 
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            // For Android 10 and below (API 30 and lower)
-            requiredPermissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
-            requiredPermissions.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Android 11+ (API 30+): MANAGE_EXTERNAL_STORAGE is checked via Environment, NOT ContextCompat.checkSelfPermission
+            if (!Environment.isExternalStorageManager()) {
+                missing.add(Manifest.permission.MANAGE_EXTERNAL_STORAGE)
+            }
         } else {
-            // For Android 11 (API 30) and above
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                // For Android 12+ (API 31+)
-                if (!Environment.isExternalStorageManager()) {
-                    requiredPermissions.add(Manifest.permission.MANAGE_EXTERNAL_STORAGE)
+            // Android 10 and below (API < 30): Check runtime storage permissions
+            instance?.let { ctx ->
+                if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                    missing.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+                }
+                if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                    missing.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 }
             }
         }
 
-        requiredPermissions.add(Manifest.permission.RECEIVE_BOOT_COMPLETED)
-        requiredPermissions.add(Manifest.permission.INTERNET)
-        requiredPermissions.add(Manifest.permission.ACCESS_NETWORK_STATE)
-
-        // Filter missing permissions
-        return requiredPermissions.filter {
-            instance?.let { ctx ->
-                ContextCompat.checkSelfPermission(ctx, it)
-            } != PackageManager.PERMISSION_GRANTED
-        }
+        return missing
     }
 
     /**
@@ -1054,64 +1119,81 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
 
     @RequiresApi(Build.VERSION_CODES.M)
     private fun triggerGraphics(nowPosition: Long) {
-        hideLogo()
-        // Always check initialization before hiding
-        if (::tickerRecyclerView.isInitialized) {
-            hideTicker()
-        }
-        hideWatermark(); //hide watermark after program completed
-        hideLowerThird()
         val graphics = currentPlaylist?.graphics
-        graphics?.let {
-            // handle live logo display
-            if(it.displayLiveLogo) {
-                showLiveLogo(graphics.logoPosition);
-            }
-            // handle repeat Watermark display
-            if(it.displayRepeatWatermark) {
-                nowProgramItem?.let { it1 -> programItems[it1] }
-                    ?.let { it2 -> triggerRepeatWatermark(it2) };
-            }
 
-            // Handle logo
-            if (it.displayLogo) {
-                showLogo(it.logoPosition)
-            }
+        // Calculate new logo state
+        val newLogoState = if (graphics != null && (graphics.displayLogo || graphics.displayLiveLogo)) {
+            "${graphics.displayLogo}#${graphics.displayLiveLogo}#${graphics.logoPosition}"
+        } else null
 
-            // Handle lowerThird
-            val lowerThirds = it.lowerThirds
-            lowerThirds?.forEach { ltd ->
-                if (StringUtils.isNotBlank(ltd.starts) && ltd.file != null) {
-                    ltd.getStartsArray().forEach { s ->
-                        val start = Math.round(s * 60 * 1000) // s is in minutes, send in ms
-                        if (start >= nowPosition) {
-                            val delayMillis = start - nowPosition
-                            if (delayMillis > 0) {
-                                lifecycleScope.launch {
-                                    delay(delayMillis)
-                                    showLowerThird(ltd)
-                                }
-                            }
-                        }
-                    }
+        // Only hide/reload logo if logo configuration has changed across playlists
+        if (newLogoState != activeLogoState) {
+            hideLogo()
+            activeLogoState = newLogoState
+            graphics?.let {
+                if (it.displayLiveLogo) {
+                    showLiveLogo(it.logoPosition)
+                } else if (it.displayLogo) {
+                    showLogo(it.logoPosition)
                 }
             }
+        }
 
-            // Handle ticker
-            val news = it.news
+        // Calculate new ticker state
+        val news = graphics?.news
+        val newTickerState = if (news != null && news.getMessagesArray().isNotEmpty()) {
+            "${news.messages}#${news.showTime}#${news.speed}"
+        } else null
+
+        // Only hide/reload ticker if ticker configuration has changed across playlists
+        if (newTickerState != activeTickerState) {
+            if (::tickerRecyclerView.isInitialized) {
+                hideTicker()
+            }
+            activeTickerState = newTickerState
             news?.let { newsData ->
                 val messages = newsData.getMessagesArray()
                 if (messages.isNotEmpty()) {
                     initTickers(newsData)
                     newsData.getStartsArray().forEach { s ->
                         val start = Math.round(s * 60 * 1000) // s is in minutes, send in ms
-                        if (start >= nowPosition) {
+                        if (start <= nowPosition) {
+                            // Start time has arrived or passed -> show ticker immediately!
+                            showTicker(newsData)
+                        } else {
+                            // Future start time -> schedule delay
                             val delayMillis = start - nowPosition
-                            if (delayMillis > 0) {
-                                lifecycleScope.launch {
-                                    delay(delayMillis)
-                                    showTicker(newsData)
-                                }
+                            lifecycleScope.launch {
+                                delay(delayMillis)
+                                showTicker(newsData)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        hideWatermark()
+        hideLowerThird()
+
+        // handle repeat Watermark display
+        if (graphics?.displayRepeatWatermark == true) {
+            nowProgramItem?.let { it1 -> programItems[it1] }
+                ?.let { it2 -> triggerRepeatWatermark(it2) }
+        }
+
+        // Handle lowerThird
+        val lowerThirds = graphics?.lowerThirds
+        lowerThirds?.forEach { ltd ->
+            if (StringUtils.isNotBlank(ltd.starts) && ltd.file != null) {
+                ltd.getStartsArray().forEach { s ->
+                    val start = Math.round(s * 60 * 1000) // s is in minutes, send in ms
+                    if (start >= nowPosition) {
+                        val delayMillis = start - nowPosition
+                        if (delayMillis > 0) {
+                            lifecycleScope.launch {
+                                delay(delayMillis)
+                                showLowerThird(ltd)
                             }
                         }
                     }
@@ -1131,11 +1213,14 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
     }
 
     private fun hideTicker() {
-        tickerRecyclerView.let {
-            if (it.visibility != View.GONE) {
-                it.visibility = View.GONE
-                Logger.log(AuditLog.Event.DISPLAY_NEWS_OFF)
-                Logger.log(AuditLog.Event.DISPLAY_TIME_OFF)
+        activeTickerState = null
+        if (::tickerRecyclerView.isInitialized) {
+            tickerRecyclerView.let {
+                if (it.visibility != View.GONE) {
+                    it.visibility = View.GONE
+                    Logger.log(AuditLog.Event.DISPLAY_NEWS_OFF)
+                    Logger.log(AuditLog.Event.DISPLAY_TIME_OFF)
+                }
             }
         }
     }
@@ -1159,6 +1244,7 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
     }
 
     private fun hideLogo() {
+        activeLogoState = null
         val topLogo = findViewById<View>(R.id.topLogo)
         val bottomLogo = findViewById<View>(R.id.bottomLogo)
 
@@ -1362,6 +1448,7 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
             this, 0, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        alarmManager?.cancel(pendingIntent)
         alarmManager?.setExactAndAllowWhileIdle(
             AlarmManager.RTC_WAKEUP,
             System.currentTimeMillis() + delay,
@@ -1391,9 +1478,6 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
                     switchNow(failedBecauseOfInternetIndex!!, false, this)
                     failedBecauseOfInternetIndex = null
                 } else {
-                    if (delay != null) {
-                        scheduleKeepAlive()
-                    }
                     if (offAir) {
                         offAir = false
                         if (delay != null) {
@@ -1403,16 +1487,9 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
                     } else {
                         offAir = player == null || !player!!.isPlaying
                     }
+                    scheduleKeepOnAir()
                 }
             }
-        }
-    }
-
-    @RequiresApi(Build.VERSION_CODES.O)
-    fun scheduleKeepAlive(delayMillis: Long = (configuration?.wait ?: 30) * 1000L) {
-        lifecycleScope.launch {
-            delay(delayMillis)
-            keepOnAir()
         }
     }
 

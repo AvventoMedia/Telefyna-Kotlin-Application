@@ -34,14 +34,18 @@ class Logger {
                 Log.i(event.name, message)
             }
             val path = Monitor.instance?.getAuditLogsFilePath(getToday())
-            val msg = String.format("%s %s: \n\t%s\n\n", getNow(), event.name, message)
-            try {
-                FileUtils.writeStringToFile(File(path as String), msg.replace("<br>", ","), StandardCharsets.UTF_8, true)
-            } catch (e: IOException) {
-                Log.e("WRITING_AUDIT_ERROR", e.message ?: "Error writing audit")
+            if (!path.isNullOrBlank()) {
+                val file = File(path)
+                val msg = String.format("%s %s: \n\t%s\n\n", getNow(), event.name, message)
+                try {
+                    // Always append log entries so logs are never deleted or overwritten
+                    FileUtils.writeStringToFile(file, msg.replace("<br>", ","), StandardCharsets.UTF_8, true)
+                } catch (e: IOException) {
+                    Log.e("WRITING_AUDIT_ERROR", e.message ?: "Error writing audit")
+                }
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                emailAudit(event, msg)
+                emailAudit(event, message)
             }
         }
 
