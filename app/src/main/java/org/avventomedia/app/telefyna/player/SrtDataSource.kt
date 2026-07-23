@@ -33,81 +33,74 @@ import java.util.LinkedList
 import java.util.Queue
 
 @OptIn(UnstableApi::class)
-class SrtDataSource :
-    BaseDataSource(/*isNetwork*/true) {
+class SrtDataSource : BaseDataSource(/*isNetwork*/ true) {
 
     companion object {
-        private const val PAYLOAD_SIZE = 1316
+        private const val DEFAULT_PAYLOAD_SIZE = 1316
     }
 
-    private val byteQueue: Queue<ByteArray> = LinkedList()
     private var socket: SrtSocket? = null
     private var srtUrl: SrtUrl? = null
 
     override fun open(dataSpec: DataSpec): Long {
-        val srtUrl = SrtUrl(dataSpec.uri)
-        socket = SrtSocket().apply {
-            require(srtUrl.transtype == Transtype.LIVE) { "Only live mode is supported" }
-            require(srtUrl.payloadSize == PAYLOAD_SIZE) { "Only payload size of $PAYLOAD_SIZE is supported" }
-            require(srtUrl.mode == SrtUrl.Mode.CALLER)
-
-            Logger.log(AuditLog.Event.CONNECTING, "Connecting to ${srtUrl.hostname}:${srtUrl.port}.")
-
-            connect(srtUrl)
+        transferInitializing(dataSpec)
+        val uri = dataSpec.uri
+        val srtUrl = try {
+            SrtUrl(uri)
+        } catch (e: Exception) {
+            Logger.log(AuditLog.Event.ERROR, "Invalid SRT URI: $uri")
+            throw IOException("Invalid SRT URI: $uri", e)
         }
-        this.srtUrl = srtUrl
-        return C.LENGTH_UNSET.toLong()
+
+        try {
+            socket = SrtSocket().apply {
+                Logger.log(AuditLog.Event.CONNECTING, "Connecting to SRT ${srtUrl.hostname}:${srtUrl.port}...")
+                connect(srtUrl)
+            }
+            this.srtUrl = srtUrl
+            transferStarted(dataSpec)
+            return C.LENGTH_UNSET.toLong()
+        } catch (e: Exception) {
+            Logger.log(AuditLog.Event.ERROR, "Failed to connect to SRT stream: ${e.message}")
+            close()
+            throw IOException("SRT connection failed: ${e.message}", e)
+        }
     }
 
-
-    /**
-     * Receives from SRT socket and feeds into a queue. Depending on the length requested
-     * from exoplayer, that amount of bytes is polled from queue and onto the buffer with the given offset.
-     *
-     * You cannot directly receive at the given length from the socket, because SRT uses a
-     * predetermined payload size that cannot be dynamic
-     */
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         if (length == 0) {
             return 0
         }
 
-        socket?.let {
-            var bytesReceived = 0
-            val rcvBuffer = it.recv(PAYLOAD_SIZE)
-            (0 until rcvBuffer.size / TS_PACKET_SIZE).forEach { i ->
-                byteQueue.offer(
-                    rcvBuffer.copyOfRange(
-                        i * TS_PACKET_SIZE,
-                        (i + 1) * TS_PACKET_SIZE
-                    )
-                )
-            }
-            var tmpBuffer = byteQueue.poll()
-            var i = 0
-            while (tmpBuffer != null) {
-                System.arraycopy(tmpBuffer, 0, buffer, offset + i * TS_PACKET_SIZE, TS_PACKET_SIZE)
-                bytesReceived += TS_PACKET_SIZE
-                i++
-                if (i * TS_PACKET_SIZE >= length) {
-                    break
-                }
-                tmpBuffer = byteQueue.poll()
-            }
+        val currentSocket = socket ?: throw IOException("SRT Socket is closed")
 
-            return bytesReceived
+        return try {
+            val rcvBuffer = currentSocket.recv(length.coerceAtMost(DEFAULT_PAYLOAD_SIZE))
+            if (rcvBuffer.isEmpty()) {
+                return C.RESULT_END_OF_INPUT
+            }
+            val bytesToCopy = rcvBuffer.size.coerceAtMost(length)
+            System.arraycopy(rcvBuffer, 0, buffer, offset, bytesToCopy)
+            bytesToCopy
+        } catch (e: Exception) {
+            // Stream EOF or socket disconnection
+            C.RESULT_END_OF_INPUT
         }
-        throw IOException("Couldn't read bytes at offset: $offset")
     }
 
-    override fun getUri(): Uri {
-        val srtUrl = srtUrl ?: return Uri.EMPTY
-        return Uri.parse(srtUrl.srtUri.toString())
+    override fun getUri(): Uri? {
+        return srtUrl?.let { Uri.parse(it.srtUri.toString()) }
     }
 
     override fun close() {
-        byteQueue.clear()
-        socket?.close()
-        socket = null
+        try {
+            socket?.close()
+        } catch (e: Exception) {
+            // Ignore close exceptions
+        } finally {
+            socket = null
+            srtUrl = null
+            transferEnded()
+        }
     }
 }
