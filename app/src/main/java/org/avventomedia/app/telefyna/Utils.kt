@@ -1,5 +1,6 @@
 package org.avventomedia.app.telefyna
 
+import android.content.Context
 import android.net.Uri
 import android.os.Build
 import androidx.annotation.RequiresApi
@@ -18,20 +19,34 @@ import kotlin.random.Random
 
 object Utils {
 
-    @RequiresApi(Build.VERSION_CODES.O)
-    /**
-     * seconds
-     */
     @JvmStatic
-    fun internetConnected(): Boolean {
+    fun internetConnected(context: Context? = Monitor.instance): Boolean {
         return try {
-            val process = Runtime.getRuntime().exec("/system/bin/ping -c 1 8.8.4.4")
-            process.waitFor() == 0
-        } catch (e: IOException) {
-            e.message?.let { Logger.log(AuditLog.Event.NO_INTERNET, it) }
-            false
-        } catch (e: InterruptedException) {
-            e.message?.let { Logger.log(AuditLog.Event.NO_INTERNET, it) }
+            if (context != null) {
+                val cm = context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+                if (cm != null) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        val network = cm.activeNetwork
+                        if (network == null) return false
+                        val capabilities = cm.getNetworkCapabilities(network)
+                        if (capabilities == null || !capabilities.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                            return false
+                        }
+                    } else {
+                        @Suppress("DEPRECATION")
+                        val netInfo = cm.activeNetworkInfo
+                        if (netInfo == null || !netInfo.isConnected) {
+                            return false
+                        }
+                    }
+                }
+            }
+            // Lightweight socket reachability check (no OS process creation or FD leak)
+            java.net.Socket().use { socket ->
+                socket.connect(java.net.InetSocketAddress("8.8.8.8", 53), 1500)
+                true
+            }
+        } catch (e: Exception) {
             false
         }
     }
