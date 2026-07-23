@@ -449,20 +449,23 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
 
     @OptIn(UnstableApi::class)
     private fun buildPlayer(context: Context): ExoPlayer {
-        /*
-        val delay = getConfiguration().wait * 1000
-        val builder = DefaultLoadControl.Builder()
-        builder.setBufferDurationsMs(
-            DefaultLoadControl.DEFAULT_MIN_BUFFER_MS + delay,
-            (DefaultLoadControl.DEFAULT_MAX_BUFFER_MS + (delay * 2)) * 2,
-            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS + delay,
-            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS + delay
-        )
-        val player = SimpleExoPlayer.Builder(instance).setLoadControl(builder.build()).build()
-        */
-        // Create a custom RenderersFactory if needed
         val renderersFactory = instance?.let { TelefynaRenderersFactory(it) }
-        player = renderersFactory?.let { ExoPlayer.Builder(context, it).build() }
+        val audioAttributes = androidx.media3.common.AudioAttributes.Builder()
+            .setUsage(androidx.media3.common.C.USAGE_MEDIA)
+            .setContentType(androidx.media3.common.C.AUDIO_CONTENT_TYPE_MOVIE)
+            .build()
+
+        player = if (renderersFactory != null) {
+            ExoPlayer.Builder(context, renderersFactory)
+                .setAudioAttributes(audioAttributes, true)
+                .setHandleAudioBecomingNoisy(true)
+                .build()
+        } else {
+            ExoPlayer.Builder(context)
+                .setAudioAttributes(audioAttributes, true)
+                .setHandleAudioBecomingNoisy(true)
+                .build()
+        }
 
         return player as ExoPlayer
     }
@@ -669,10 +672,12 @@ class Monitor : AppCompatActivity(), PlayerNotificationManager.NotificationListe
                             player!!.volume = 0f
                             val fadeInAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
                                 duration = CROSS_FADE_DURATION
-                                addUpdateListener { player!!.volume = it.animatedValue as Float }
+                                addUpdateListener { player?.volume = it.animatedValue as Float }
                             }
                             fadeInAnimator.start()
                             Logger.log(AuditLog.Event.FADE_PLAYED, "fade in transition played")
+                        } else {
+                            player!!.volume = 1f
                         }
                         instance?.let { player!!.addListener(it) }
                         player!!.playWhenReady = true
