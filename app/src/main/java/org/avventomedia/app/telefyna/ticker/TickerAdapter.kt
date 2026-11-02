@@ -2,18 +2,23 @@ package org.avventomedia.app.telefyna.ticker
 
 import android.annotation.SuppressLint
 import android.os.Build
+import android.util.TypedValue
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.RelativeLayout
 import android.widget.TextView
 import androidx.annotation.OptIn
 import androidx.annotation.RequiresApi
 import androidx.media3.common.util.UnstableApi
 import androidx.recyclerview.widget.RecyclerView
+import org.avventomedia.app.telefyna.GraphicsScale
 import org.avventomedia.app.telefyna.R
 
 class TickerAdapter(
-    private val items: List<TickerItem>
+    val items: List<TickerItem>,
+    // On-air size of the ticker (GraphicsScale); 0 keeps the layout's own sizes
+    private val scale: Float = 0f
 ) : RecyclerView.Adapter<TickerAdapter.TickerViewHolder>() {
 
     inner class TickerViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
@@ -27,7 +32,26 @@ class TickerAdapter(
         val view = LayoutInflater.from(parent.context).inflate(R.layout.ticker_scroll, parent, false)
         return TickerViewHolder(view).apply {
             itemView.setBackgroundColor(android.graphics.Color.TRANSPARENT)
+            if (scale > 0f) applyScale(this)
         }
+    }
+
+    private fun applyScale(holder: TickerViewHolder) {
+        val px = { reference: Int -> GraphicsScale.px(reference, scale) }
+        holder.tickerText.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(GraphicsScale.TICKER_TEXT).toFloat())
+        holder.timeClock.setTextSize(TypedValue.COMPLEX_UNIT_PX, px(GraphicsScale.TICKER_CLOCK_TEXT).toFloat())
+        holder.timeClock.setPadding(px(GraphicsScale.TICKER_CLOCK_PADDING_START), 0, px(GraphicsScale.TICKER_CLOCK_PADDING_END), holder.timeClock.paddingBottom)
+        (holder.timeClock.layoutParams as ViewGroup.MarginLayoutParams).marginStart = px(-GraphicsScale.TICKER_CLOCK_OVERLAP)
+        // The white strip at the start is exactly as tall as the ticker bar, never taller
+        holder.whiteLabel.setPadding(0, 0, 0, 0)
+        (holder.whiteLabel.layoutParams as RelativeLayout.LayoutParams).apply {
+            width = px(GraphicsScale.TICKER_STRIP_WIDTH)
+            height = 0
+            marginStart = px(GraphicsScale.TICKER_START)
+            addRule(RelativeLayout.ALIGN_TOP, R.id.scrollTextImageSection)
+            addRule(RelativeLayout.ALIGN_BOTTOM, R.id.scrollTextImageSection)
+        }
+        ((holder.tickerText.parent as View).layoutParams as ViewGroup.MarginLayoutParams).marginEnd = px(GraphicsScale.TICKER_TEXT_END)
     }
 
     @OptIn(UnstableApi::class)
